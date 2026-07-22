@@ -22,11 +22,7 @@ Install all dependencies using pip:
 
 bash
 pip install numpy pandas matplotlib scipy emcee corner openpyxl
-Clone the Repository
-bash
-git clone https://github.com/YOUR_USERNAME/REPO_NAME.git
-cd REPO_NAME
-Configuration
+
 All user‑adjustable settings are at the top of the script (USER CONFIGURATION section). Open the script in a text editor and modify:
 
 Parameter	Description
