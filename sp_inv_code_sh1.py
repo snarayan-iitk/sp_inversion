@@ -11,26 +11,30 @@ import warnings
 import time
 import corner
 
+# NEW imports for convergence plot
+from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LinearSegmentedColormap
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
  
 # -----------------------------
 # USER CONFIGURATION
 # -----------------------------
-FILE_PATH = r"D:\GSI_data\Harmara_west\Sheet_200.xlsx"
+FILE_PATH = r"D:\GSI_data\Harmara_west\Sheet_200_test.xlsx"
 OUTPUT_DIR = r"D:\GSI_data\Harmara_west\Inversion_Results"  # Folder to save images
 
 # Inversion Settings
 MAX_SOURCES = 1               # Max number of overlapping bodies to test per profile
-MCMC_WALKERS = 200             # Number of walkers for MCMC (Reduced for speed in testing)
-MCMC_STEPS = 2000             # Total MCMC steps
-MCMC_BURN_IN = 500           # Steps to discard as burn-in
+MCMC_WALKERS = 500             # Number of walkers for MCMC (Reduced for speed in testing)
+MCMC_STEPS = 3000         # Total MCMC steps
+MCMC_BURN_IN = 1000           # Steps to discard as burn-in
 CONFIDENCE_INTERVAL = 90      # Confidence interval for uncertainty plotting (%)
 
 # NEW: Geological constraints based on known geology from borehole
-GEOLOGY_TYPE = "massive_sulfide"  # Options: "massive_sulfide", "graphite", "unknown"
+GEOLOGY_TYPE = "unknown"  # Options: "massive_sulfide", "graphite", "unknown"
 BOREHOLE_DEPTH = 60  # Known depth from borehole in meters
-BOREHOLES_AVAILABLE = True  # Set to False if no borehole data
+BOREHOLES_AVAILABLE = False  # Set to False if no borehole data
 
 # VISUALIZATION SETTINGS (Font Sizes)
 TITLE_FONT =  20
@@ -91,6 +95,10 @@ class BayesianInversion:
         
         # NEW: Precompute weights for near-surface sensitivity (Solution C)
         self.weights = self._compute_weights()
+        
+        # NEW: Storage for MCMC diagnostics
+        self.chain = None
+        self.sampler = None
         
     def _compute_weights(self):
         """Solution C: Weight near-surface sensitivity"""
@@ -239,9 +247,255 @@ class BayesianInversion:
         
         sampler.run_mcmc(pos, MCMC_STEPS, progress=False)
         
+        # Store chain and sampler for diagnostics
+        self.sampler = sampler
+        self.chain = sampler.get_chain()   # shape (n_steps, n_walkers, ndim)
+        
         # Discard burn-in and flatten
         flat_samples = sampler.get_chain(discard=MCMC_BURN_IN, flat=True)
-        return flat_samples
+        return flat_samples, sampler
+
+    # NEW: Helper to compute final R-hat (split chains)
+    def _compute_rhat_final(self, chain, n_groups=2):
+        """Compute Gelman-Rubin R-hat for each parameter using split chains."""
+        n_steps, n_walkers, ndim = chain.shape
+        group_size = n_walkers // n_groups
+        if group_size < 2:
+            raise ValueError("Too few walkers per group (need at least 2).")
+        # Split walkers into groups
+        groups = [chain[:, i*group_size:(i+1)*group_size, :] for i in range(n_groups)]
+        chain_means = np.zeros((n_groups, ndim))
+        chain_vars = np.zeros((n_groups, ndim))
+        for g in range(n_groups):
+            flat = groups[g].reshape(-1, ndim)
+            chain_means[g] = np.mean(flat, axis=0)
+            chain_vars[g] = np.var(flat, axis=0, ddof=1)
+        W = np.mean(chain_vars, axis=0)
+        B = n_steps * group_size * np.var(chain_means, axis=0, ddof=1)
+        var_hat = (1 - 1/(n_steps*group_size)) * W + B/(n_steps*group_size)
+        rhat = np.sqrt(var_hat / W)
+        return rhat
+
+    # -------------------- NEW CONVERGENCE PLOT (9-panel) --------------------
+    def plot_convergence(self, profile_name, output_dir):
+        """
+        Generates a 9‑panel diagnostic figure:
+          - R‑hat bar plot (with threshold 1.1)
+          - ESS bar plot (with threshold 100)
+          - Correlation matrix heatmap
+          - Trace plots for z, α, q of first body
+          - Posterior histograms for z, α, q
+        Saves the figure and displays it.
+        """
+        if self.chain is None or self.sampler is None:
+            print("  No MCMC chain available. Run MCMC first.")
+            return
+
+        chain = self.chain          # (n_steps, n_walkers, ndim)
+        n_steps, n_walkers, ndim = chain.shape
+
+        # ---------------------------
+        # 1. Compute R-hat and ESS
+        # ---------------------------
+        rhat = self._compute_rhat_final(chain, n_groups=2)
+        # ESS: use autocorrelation time
+        try:
+            tau = self.sampler.get_autocorr_time()
+            ess = n_steps * n_walkers / tau
+        except:
+            ess = np.ones(ndim) * n_steps * n_walkers * 0.1   # fallback
+
+        # Flatten samples (after burn-in) for correlation & histograms
+        flat_samples = self.sampler.get_chain(discard=MCMC_BURN_IN, flat=True)  # (N, ndim)
+
+        # Parameter names
+        param_names = ["Offset"]
+        for i in range(1, ndim):
+            # Determine which body and parameter
+            idx = i - 1
+            body = idx // 5
+            param = idx % 5
+            if param == 0:
+                name = f"K{body+1}"
+            elif param == 1:
+                name = f"x{body+1}"
+            elif param == 2:
+                name = f"z{body+1}"
+            elif param == 3:
+                name = f"α{body+1}"
+            else:
+                name = f"q{body+1}"
+            param_names.append(name)
+
+        # Indices for first body's z, α, q (assume at least one body)
+        z_idx = 3 if ndim > 3 else None
+        alpha_idx = 4 if ndim > 4 else None
+        q_idx = 5 if ndim > 5 else None
+
+        # ---------------------------
+        # 2. Create 9-panel figure
+        # ---------------------------
+        fig = plt.figure(figsize=(20, 14))
+        gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+
+        # ---------- Panel 1: R-hat bars ----------
+        ax1 = fig.add_subplot(gs[0, 0])
+        colors = ['#2ecc71' if r < 1.1 else '#e74c3c' for r in rhat]
+        bars = ax1.bar(range(ndim), rhat, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
+        ax1.axhline(y=1.1, color='#e74c3c', linestyle='--', linewidth=2.5, label='Threshold (1.1)', alpha=0.8)
+        ax1.axhline(y=1.0, color='#3498db', linestyle='--', linewidth=1.5, alpha=0.5)
+        ax1.set_xticks(range(ndim))
+        ax1.set_xticklabels(param_names, rotation=45, ha='right', fontsize=10)
+        ax1.set_ylabel('R-hat Value', fontsize=12, fontweight='bold')
+        ax1.set_title('Gelman-Rubin Diagnostic', fontsize=14, fontweight='bold')
+        ax1.legend(loc='upper right', fontsize=10)
+        ax1.grid(alpha=0.2, axis='y', linestyle='--')
+        ax1.set_ylim(0.95, max(1.5, max(rhat) * 1.1))
+        # Add value labels
+        for bar, val in zip(bars, rhat):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                     f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+        # ---------- Panel 2: ESS bars ----------
+        ax2 = fig.add_subplot(gs[0, 1])
+        bars = ax2.bar(range(ndim), ess, alpha=0.7, color='#3498db', edgecolor='black', linewidth=1)
+        ax2.axhline(y=100, color='#e74c3c', linestyle='--', linewidth=2.5, label='Min ESS (100)', alpha=0.8)
+        ax2.set_xticks(range(ndim))
+        ax2.set_xticklabels(param_names, rotation=45, ha='right', fontsize=10)
+        ax2.set_ylabel('Effective Sample Size', fontsize=12, fontweight='bold')
+        ax2.set_title('ESS Diagnostics', fontsize=14, fontweight='bold')
+        ax2.legend(loc='upper right', fontsize=10)
+        ax2.grid(alpha=0.2, axis='y', linestyle='--')
+        # Value labels
+        for bar, val in zip(bars, ess):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + max(ess)*0.02,
+                     f'{val:.0f}', ha='center', va='bottom', fontsize=8, rotation=90)
+
+        # ---------- Panel 3: Correlation matrix ----------
+        ax3 = fig.add_subplot(gs[0, 2])
+        corr_matrix = np.corrcoef(flat_samples.T)
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+        cmap = LinearSegmentedColormap.from_list('RdYlBu_r', ['#d73027', '#f46d43', '#fdae61',
+                                                              '#fee090', '#ffffbf', '#e0f3f8',
+                                                              '#abd9e9', '#74add1', '#4575b4'])
+        im = ax3.imshow(corr_matrix, cmap=cmap, vmin=-1, vmax=1, aspect='auto')
+        ax3.set_xticks(range(ndim))
+        ax3.set_yticks(range(ndim))
+        ax3.set_xticklabels(param_names, rotation=90, fontsize=8)
+        ax3.set_yticklabels(param_names, fontsize=8)
+        ax3.set_title('Posterior Correlation Matrix', fontsize=14, fontweight='bold')
+        cbar = plt.colorbar(im, ax=ax3, shrink=0.8)
+        cbar.set_label('Correlation', fontsize=10, fontweight='bold')
+
+        # ---------- Panels 4-6: Trace plots (z, α, q) ----------
+        if z_idx is not None and alpha_idx is not None and q_idx is not None:
+            # Depth (z)
+            ax4 = fig.add_subplot(gs[1, 0])
+            for w in range(min(30, n_walkers)):
+                z_chain = chain[:, w, z_idx]
+                ax4.plot(z_chain, color='#e74c3c', alpha=0.15, linewidth=0.8)
+            z_mean = np.mean(chain[:, :, z_idx])
+            ax4.axhline(y=z_mean, color='#c0392b', linewidth=2, linestyle='--',
+                       label=f'Mean: {z_mean:.1f}m')
+            ax4.set_xlabel('Step', fontsize=12)
+            ax4.set_ylabel('Depth (z) [m]', fontsize=12, fontweight='bold')
+            ax4.set_title('Trace Plot: Depth', fontsize=13, fontweight='bold')
+            ax4.legend(loc='upper right', fontsize=9)
+            ax4.grid(alpha=0.2, linestyle='--')
+
+            # Angle (α)
+            ax5 = fig.add_subplot(gs[1, 1])
+            for w in range(min(30, n_walkers)):
+                alpha_chain = chain[:, w, alpha_idx]
+                ax5.plot(alpha_chain, color='#3498db', alpha=0.15, linewidth=0.8)
+            alpha_mean = np.mean(chain[:, :, alpha_idx])
+            ax5.axhline(y=alpha_mean, color='#2980b9', linewidth=2, linestyle='--',
+                       label=f'Mean: {alpha_mean:.1f}°')
+            ax5.set_xlabel('Step', fontsize=12)
+            ax5.set_ylabel('Angle (α) [°]', fontsize=12, fontweight='bold')
+            ax5.set_title('Trace Plot: Polarization Angle', fontsize=13, fontweight='bold')
+            ax5.legend(loc='upper right', fontsize=9)
+            ax5.grid(alpha=0.2, linestyle='--')
+
+            # Shape factor (q)
+            ax6 = fig.add_subplot(gs[1, 2])
+            for w in range(min(30, n_walkers)):
+                q_chain = chain[:, w, q_idx]
+                ax6.plot(q_chain, color='#27ae60', alpha=0.15, linewidth=0.8)
+            q_mean = np.mean(chain[:, :, q_idx])
+            ax6.axhline(y=q_mean, color='#229954', linewidth=2, linestyle='--',
+                       label=f'Mean: {q_mean:.2f}')
+            ax6.set_xlabel('Step', fontsize=12)
+            ax6.set_ylabel('Shape Factor (q)', fontsize=12, fontweight='bold')
+            ax6.set_title('Trace Plot: Shape Factor', fontsize=13, fontweight='bold')
+            ax6.legend(loc='upper right', fontsize=9)
+            ax6.grid(alpha=0.2, linestyle='--')
+
+            # ---------- Panels 7-9: Posterior histograms ----------
+            # Depth histogram
+            ax7 = fig.add_subplot(gs[2, 0])
+            z_samples = flat_samples[:, z_idx]
+            ax7.hist(z_samples, bins=40, density=True, color='#e74c3c', alpha=0.7,
+                    edgecolor='white', linewidth=0.5)
+            ax7.axvline(z_mean, color='#c0392b', linewidth=2.5, linestyle='-', label=f'Mean: {z_mean:.1f}m')
+            ax7.axvline(np.percentile(z_samples, 16), color='#c0392b', linewidth=1.5,
+                       linestyle='--', alpha=0.7, label='16th/84th percentile')
+            ax7.axvline(np.percentile(z_samples, 84), color='#c0392b', linewidth=1.5, linestyle='--', alpha=0.7)
+            ax7.set_xlabel('Depth (z) [m]', fontsize=12)
+            ax7.set_ylabel('Density', fontsize=12)
+            ax7.set_title('Posterior: Depth', fontsize=13, fontweight='bold')
+            ax7.legend(loc='upper right', fontsize=9)
+            ax7.grid(alpha=0.2, linestyle='--')
+
+            # Angle histogram
+            ax8 = fig.add_subplot(gs[2, 1])
+            alpha_samples = flat_samples[:, alpha_idx]
+            ax8.hist(alpha_samples, bins=40, density=True, color='#3498db', alpha=0.7,
+                    edgecolor='white', linewidth=0.5)
+            ax8.axvline(alpha_mean, color='#2980b9', linewidth=2.5, linestyle='-',
+                       label=f'Mean: {alpha_mean:.1f}°')
+            ax8.axvline(np.percentile(alpha_samples, 16), color='#2980b9', linewidth=1.5,
+                       linestyle='--', alpha=0.7, label='16th/84th percentile')
+            ax8.axvline(np.percentile(alpha_samples, 84), color='#2980b9', linewidth=1.5, linestyle='--', alpha=0.7)
+            ax8.set_xlabel('Angle (α) [°]', fontsize=12)
+            ax8.set_ylabel('Density', fontsize=12)
+            ax8.set_title('Posterior: Polarization Angle', fontsize=13, fontweight='bold')
+            ax8.legend(loc='upper right', fontsize=9)
+            ax8.grid(alpha=0.2, linestyle='--')
+
+            # Shape histogram
+            ax9 = fig.add_subplot(gs[2, 2])
+            q_samples = flat_samples[:, q_idx]
+            ax9.hist(q_samples, bins=40, density=True, color='#27ae60', alpha=0.7,
+                    edgecolor='white', linewidth=0.5)
+            ax9.axvline(q_mean, color='#229954', linewidth=2.5, linestyle='-',
+                       label=f'Mean: {q_mean:.2f}')
+            ax9.axvline(np.percentile(q_samples, 16), color='#229954', linewidth=1.5,
+                       linestyle='--', alpha=0.7, label='16th/84th percentile')
+            ax9.axvline(np.percentile(q_samples, 84), color='#229954', linewidth=1.5, linestyle='--', alpha=0.7)
+            ax9.set_xlabel('Shape Factor (q)', fontsize=12)
+            ax9.set_ylabel('Density', fontsize=12)
+            ax9.set_title('Posterior: Shape Factor', fontsize=13, fontweight='bold')
+            ax9.legend(loc='upper right', fontsize=9)
+            ax9.grid(alpha=0.2, linestyle='--')
+
+        # ---------------------------
+        # 3. Finish and save
+        # ---------------------------
+        plt.suptitle(f'Convergence Diagnostics - {profile_name}',
+                    fontsize=18, fontweight='bold', y=0.98)
+        plt.tight_layout()
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        save_path = os.path.join(output_dir, f"{profile_name}_Convergence.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"   > Convergence plot saved to: {save_path}")
+        plt.show()
+        plt.close(fig)
 
     # NEW: Diagnostic function for depth overestimation
     def diagnose_depth_overestimation(self, samples, true_depth=None):
@@ -292,6 +546,82 @@ class BayesianInversion:
             print("✓ Profile length adequate for depth estimation")
         
         print("="*50)
+
+    # ---------- OLD R-hat plot (kept but not used) ----------
+    def compute_rhat(self, chain, n_groups=2):
+        """
+        Compute R-hat for each parameter at each step.
+        chain: shape (n_steps, n_walkers, ndim)
+        Splits walkers into n_groups (each group = one chain).
+        Returns rhats: shape (n_steps, ndim)
+        """
+        n_steps, n_walkers, ndim = chain.shape
+        if n_steps < 2:
+            return np.ones((n_steps, ndim))
+        group_size = n_walkers // n_groups
+        if group_size < 2:
+            raise ValueError("Too few walkers per group for R-hat computation.")
+        groups = [chain[:, i*group_size:(i+1)*group_size, :] for i in range(n_groups)]
+        
+        rhats = np.zeros((n_steps, ndim))
+        steps_to_compute = np.arange(1, n_steps, 10)
+        for t in steps_to_compute:
+            chain_means = np.zeros((n_groups, ndim))
+            chain_vars = np.zeros((n_groups, ndim))
+            for g in range(n_groups):
+                group_samples = groups[g][:t+1, :, :]  # shape (t+1, group_size, ndim)
+                flat = group_samples.reshape(-1, ndim)
+                chain_means[g] = np.mean(flat, axis=0)
+                chain_vars[g] = np.var(flat, axis=0, ddof=1)
+            n_samples_per_chain = (t+1) * group_size
+            B = n_samples_per_chain * np.var(chain_means, axis=0, ddof=1)
+            W = np.mean(chain_vars, axis=0)
+            W_safe = np.where(W < 1e-12, 1e-12, W)
+            var_hat = (1 - 1/n_samples_per_chain) * W_safe + (1/n_samples_per_chain) * B
+            rhat = np.sqrt(var_hat / W_safe)
+            rhats[t] = rhat
+        last_val = 1.0
+        for t in range(n_steps):
+            if t in steps_to_compute:
+                last_val = rhats[t]
+            else:
+                rhats[t] = last_val
+        return rhats
+
+    def plot_rhat(self, rhats, param_indices, param_names, title=""):
+        """
+        Enhanced R-hat plot with subplots, burn-in shading, and final R-hat annotations.
+        (Kept for backward compatibility, but not called anymore)
+        """
+        n_params = len(param_indices)
+        fig, axes = plt.subplots(1, n_params, figsize=(5*n_params, 6), sharex=True)
+        if n_params == 1:
+            axes = [axes]
+        
+        final_rhat = rhats[-1, param_indices]
+        n_steps = rhats.shape[0]
+        
+        for i, (idx, name) in enumerate(zip(param_indices, param_names)):
+            ax = axes[i]
+            ax.plot(rhats[:, idx], color=f'C{i}', linewidth=2.5, label=name)
+            ax.axhline(y=1.1, color='k', linestyle='--', alpha=0.7, linewidth=2)
+            if MCMC_BURN_IN > 0 and MCMC_BURN_IN < n_steps:
+                ax.axvspan(0, MCMC_BURN_IN, alpha=0.15, color='gray', label='Burn-in')
+            ax.text(0.95, 0.05, f'R = {final_rhat[i]:.3f}',
+                    transform=ax.transAxes, ha='right', va='bottom',
+                    fontsize=LEGEND_FONT, bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
+            ax.set_title(name, fontsize=TITLE_FONT, fontweight='bold')
+            ax.set_ylabel('R-hat', fontsize=LABEL_FONT)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=TICK_FONT)
+            if i == 0:
+                ax.legend(loc='upper right', fontsize=LEGEND_FONT-2)
+        
+        axes[-1].set_xlabel('MCMC Step', fontsize=LABEL_FONT)
+        fig.suptitle(f'Gelman-Rubin Convergence Diagnostic - {title}',
+                     fontsize=TITLE_FONT, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        return fig
 
 # -----------------------------
 # SYNTHETIC TEST MODULE
@@ -345,6 +675,26 @@ class SyntheticTest:
         print(f"    - Depth (z): {self.sphere_true[3]} m")
         print(f"    - Angle (α): {self.sphere_true[4]}°")
         print(f"    - Shape (q): {self.sphere_true[5]} (Sphere)")
+        print(f"    - Added 5% Random Gaussian Noise")
+
+    # NEW: generate_sheet_data
+    def generate_sheet_data(self):
+        """Generates noisy synthetic data for a dipping sheet model (q=0.5)."""
+        # Model: Dipping Sheet (q=0.5), Depth=40m, Angle=-20 deg
+        self.sheet_true = np.array([0.0, -3000, 450, 35.0, -20.0, 0.5])
+        self.y_clean_sheet = forward_model_multi_source(self.x_synth, self.sheet_true)
+        # Add 5% Gaussian Noise
+        noise_level = 0.05 * np.max(np.abs(self.y_clean_sheet))
+        np.random.seed(44)
+        noise = np.random.normal(0, noise_level, len(self.x_synth))
+        self.y_noisy_sheet = self.y_clean_sheet + noise
+        print("\n" + "-"*40)
+        print("  SHEET MODEL TEST (q = 0.5)")
+        print("-"*40)
+        print(f"  Ground Truth Parameters:")
+        print(f"    - Depth (z): {self.sheet_true[3]} m")
+        print(f"    - Angle (α): {self.sheet_true[4]}°")
+        print(f"    - Shape (q): {self.sheet_true[5]} (Dipping Sheet)")
         print(f"    - Added 5% Random Gaussian Noise")
 
     def plot_corner(self, samples, true_params, model_name):
@@ -407,10 +757,13 @@ class SyntheticTest:
         
         # Run Optimization
         best_guess, _ = inversion.optimize_global(num_bodies=1)
-        samples = inversion.run_mcmc(best_guess, num_bodies=1)
+        samples, sampler = inversion.run_mcmc(best_guess, num_bodies=1)
         
         # Run diagnosis
         inversion.diagnose_depth_overestimation(samples, true_params[3])
+        
+        # NEW: Plot convergence diagnostics
+        inversion.plot_convergence(model_name, OUTPUT_DIR)
         
         # Get Inverted Statistics
         inverted_params = np.median(samples, axis=0)
@@ -465,18 +818,16 @@ class SyntheticTest:
         return inverted_params, samples
 
     def run_fidelity_check(self):
-        """Runs both cylinder and sphere synthetic tests with corner plots."""
+        """Runs cylinder, sphere, and sheet synthetic tests with corner plots."""
         self.generate_cylinder_data()
         self.generate_sphere_data()
+        self.generate_sheet_data()   # NEW
         
         # Test Cylinder Model
         cyl_params, cyl_samples = self.run_single_test(
             self.x_synth, self.y_noisy_cyl, 
             self.cylinder_true, "Cylinder"
         )
-        
-        # Create corner plot for cylinder (only alpha, z, q)
-        print("\n > Generating corner plot for Cylinder model (α, z, q)...")
         self.plot_corner(cyl_samples, self.cylinder_true, "Cylinder")
         
         # Test Sphere Model
@@ -484,134 +835,121 @@ class SyntheticTest:
             self.x_synth, self.y_noisy_sph, 
             self.sphere_true, "Sphere"
         )
-        
-        # Create corner plot for sphere (only alpha, z, q)
-        print("\n > Generating corner plot for Sphere model (α, z, q)...")
         self.plot_corner(sph_samples, self.sphere_true, "Sphere")
         
-        # Plotting both results side by side (original visualization)
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        # Test Sheet Model (NEW)
+        sheet_params, sheet_samples = self.run_single_test(
+            self.x_synth, self.y_noisy_sheet,
+            self.sheet_true, "Sheet"
+        )
+        self.plot_corner(sheet_samples, self.sheet_true, "Sheet")
         
-        # Cylinder Model Plot (Top row)
-        ax1, ax2 = axes[0, 0], axes[0, 1]
+        # -----------------------------
+        # Plotting all three results side by side (extend to 3 columns)
+        # -----------------------------
+        fig, axes = plt.subplots(3, 2, figsize=(18, 18))
         
-        # Data fit plot for Cylinder
-        inds = np.random.randint(len(cyl_samples), size=50)
-        for ind in inds:
-            sample = cyl_samples[ind]
-            y_sample = forward_model_multi_source(self.x_synth, sample)
-            ax1.plot(self.x_synth, y_sample, color='red', alpha=0.05)
+        # Define list of (model_name, y_noisy, y_clean, params, true_params)
+        models = [
+            ("Cylinder", self.y_noisy_cyl, self.y_clean_cyl, cyl_params, self.cylinder_true),
+            ("Sphere",   self.y_noisy_sph, self.y_clean_sph, sph_params, self.sphere_true),
+            ("Sheet",    self.y_noisy_sheet, self.y_clean_sheet, sheet_params, self.sheet_true)
+        ]
         
-        ax1.plot(self.x_synth, self.y_noisy_cyl, 'k.', label='Noisy Data', markersize=4)
-        ax1.plot(self.x_synth, self.y_clean_cyl, 'g--', linewidth=2, label='Ground Truth')
-        ax1.plot(self.x_synth, forward_model_multi_source(self.x_synth, cyl_params), 
-                'r-', linewidth=2, label='Inverted Model')
-        
-        z_err = abs(cyl_params[3] - self.cylinder_true[3]) / self.cylinder_true[3] * 100
-        ax1.set_title(f"Cylinder Model Test (Depth Error: {z_err:.1f}%)", 
-                     fontsize=TITLE_FONT, fontweight='bold')
-        ax1.set_ylabel("SP (mV)", fontsize=LABEL_FONT)
-        ax1.legend(fontsize=LEGEND_FONT, loc='best')
-        ax1.grid(alpha=0.3)
-        ax1.tick_params(labelsize=TICK_FONT)
-        
-        # Subsurface plot for Cylinder
-        ax2.set_title(f"Cylinder Model (q={cyl_params[5]:.2f})", 
-                     fontsize=TITLE_FONT, fontweight='bold')
-        ax2.set_ylabel("Depth (m)", fontsize=LABEL_FONT)
-        ax2.set_xlabel("Distance (m)", fontsize=LABEL_FONT)
-        ax2.invert_yaxis()
-        ax2.axhline(0, color='brown', linewidth=2)
-        
-        # Plot cylinder body
-        circle = patches.Circle((cyl_params[2], cyl_params[3]), 
-                               radius=cyl_params[3]/4, 
-                               facecolor='mistyrose', 
-                               edgecolor='red', 
-                               linewidth=2,
-                               alpha=0.7)
-        ax2.add_patch(circle)
-        ax2.scatter(cyl_params[2], cyl_params[3], marker='+', s=200, color='black', zorder=10)
-        ax2.text(cyl_params[2], cyl_params[3] - 15, 
-                f"Z={cyl_params[3]:.1f}m\nα={cyl_params[4]:.1f}°", 
-                ha='center', fontsize=TICK_FONT, fontweight='bold')
-        
-        # Mark true position
-        ax2.scatter(self.cylinder_true[2], self.cylinder_true[3], 
-                   marker='x', s=200, color='green', label='True Position', zorder=5)
-        ax2.legend(fontsize=LEGEND_FONT, loc='lower right')
-        ax2.grid(alpha=0.3)
-        ax2.tick_params(labelsize=TICK_FONT)
-        ax2.set_xlim([200, 800])
-        ax2.set_ylim([100, 0])
-        
-        # Sphere Model Plot (Bottom row)
-        ax3, ax4 = axes[1, 0], axes[1, 1]
-        
-        # Data fit plot for Sphere
-        inds = np.random.randint(len(sph_samples), size=50)
-        for ind in inds:
-            sample = sph_samples[ind]
-            y_sample = forward_model_multi_source(self.x_synth, sample)
-            ax3.plot(self.x_synth, y_sample, color='red', alpha=0.05)
-        
-        ax3.plot(self.x_synth, self.y_noisy_sph, 'k.', label='Noisy Data', markersize=4)
-        ax3.plot(self.x_synth, self.y_clean_sph, 'g--', linewidth=2, label='Ground Truth')
-        ax3.plot(self.x_synth, forward_model_multi_source(self.x_synth, sph_params), 
-                'r-', linewidth=2, label='Inverted Model')
-        
-        z_err = abs(sph_params[3] - self.sphere_true[3]) / self.sphere_true[3] * 100
-        ax3.set_title(f"Sphere Model Test (Depth Error: {z_err:.1f}%)", 
-                     fontsize=TITLE_FONT, fontweight='bold')
-        ax3.set_xlabel("Distance (m)", fontsize=LABEL_FONT)
-        ax3.set_ylabel("SP (mV)", fontsize=LABEL_FONT)
-        ax3.legend(fontsize=LEGEND_FONT, loc='best')
-        ax3.grid(alpha=0.3)
-        ax3.tick_params(labelsize=TICK_FONT)
-        
-        # Subsurface plot for Sphere
-        ax4.set_title(f"Sphere Model (q={sph_params[5]:.2f})", 
-                     fontsize=TITLE_FONT, fontweight='bold')
-        ax4.set_xlabel("Distance (m)", fontsize=LABEL_FONT)
-        ax4.set_ylabel("Depth (m)", fontsize=LABEL_FONT)
-        ax4.invert_yaxis()
-        ax4.axhline(0, color='brown', linewidth=2)
-        
-        # Plot sphere body
-        circle = patches.Circle((sph_params[2], sph_params[3]), 
-                               radius=sph_params[3]/4, 
-                               facecolor='lightblue', 
-                               edgecolor='blue', 
-                               linewidth=2,
-                               alpha=0.7)
-        ax4.add_patch(circle)
-        ax4.scatter(sph_params[2], sph_params[3], marker='+', s=200, color='black', zorder=10)
-        ax4.text(sph_params[2], sph_params[3] - 20, 
-                f"Z={sph_params[3]:.1f}m\nα={sph_params[4]:.1f}°", 
-                ha='center', fontsize=TICK_FONT, fontweight='bold')
-        
-        # Mark true position
-        ax4.scatter(self.sphere_true[2], self.sphere_true[3], 
-                   marker='x', s=200, color='green', label='True Position', zorder=5)
-        ax4.legend(fontsize=LEGEND_FONT, loc='lower right')
-        ax4.grid(alpha=0.3)
-        ax4.tick_params(labelsize=TICK_FONT)
-        ax4.set_xlim([200, 800])
-        ax4.set_ylim([120, 0])
+        for row, (name, y_noisy, y_clean, inv_params, true_params) in enumerate(models):
+            ax1 = axes[row, 0]
+            ax2 = axes[row, 1]
+            
+            # Data fit plot
+            inds = np.random.randint(len(cyl_samples), size=50)  # reuse any samples
+            # We'll plot posterior samples for this model (we have samples from previous run)
+            # Actually, we have separate samples for each model; we need to use the correct ones.
+            # We'll store them in a dict.
+            if name == "Cylinder":
+                samples_plot = cyl_samples
+            elif name == "Sphere":
+                samples_plot = sph_samples
+            else:
+                samples_plot = sheet_samples
+                
+            for ind in np.random.randint(len(samples_plot), size=50):
+                sample = samples_plot[ind]
+                y_sample = forward_model_multi_source(self.x_synth, sample)
+                ax1.plot(self.x_synth, y_sample, color='red', alpha=0.05)
+            
+            ax1.plot(self.x_synth, y_noisy, 'k.', label='Noisy Data', markersize=4)
+            ax1.plot(self.x_synth, y_clean, 'g--', linewidth=2, label='Ground Truth')
+            ax1.plot(self.x_synth, forward_model_multi_source(self.x_synth, inv_params), 
+                    'r-', linewidth=2, label='Inverted Model')
+            
+            z_err = abs(inv_params[3] - true_params[3]) / true_params[3] * 100
+            ax1.set_title(f"{name} Model (Depth Error: {z_err:.1f}%)", 
+                         fontsize=TITLE_FONT, fontweight='bold')
+            ax1.set_ylabel("SP (mV)", fontsize=LABEL_FONT)
+            if row == 2:
+                ax1.set_xlabel("Distance (m)", fontsize=LABEL_FONT)
+            ax1.legend(fontsize=LEGEND_FONT, loc='best')
+            ax1.grid(alpha=0.3)
+            ax1.tick_params(labelsize=TICK_FONT)
+            
+            # Subsurface plot
+            ax2.set_title(f"{name} Model (q={inv_params[5]:.2f})", 
+                         fontsize=TITLE_FONT, fontweight='bold')
+            ax2.set_ylabel("Depth (m)", fontsize=LABEL_FONT)
+            if row == 2:
+                ax2.set_xlabel("Distance (m)", fontsize=LABEL_FONT)
+            ax2.invert_yaxis()
+            ax2.axhline(0, color='brown', linewidth=2)
+            
+            # Determine body shape for plotting
+            q = inv_params[5]
+            if q >= 1.3:
+                # Sphere
+                circle = patches.Circle((inv_params[2], inv_params[3]), 
+                                       radius=inv_params[3]/4, 
+                                       facecolor='lightblue', edgecolor='blue', 
+                                       linewidth=2, alpha=0.7)
+                ax2.add_patch(circle)
+            elif 0.8 <= q < 1.3:
+                # Cylinder
+                circle = patches.Circle((inv_params[2], inv_params[3]), 
+                                       radius=inv_params[3]/4, 
+                                       facecolor='mistyrose', edgecolor='red', 
+                                       linewidth=2, alpha=0.7)
+                ax2.add_patch(circle)
+            else:
+                # Dipping Sheet
+                length = 30
+                dx = length * np.cos(np.radians(inv_params[4] - 90))
+                dy = length * np.sin(np.radians(inv_params[4] - 90))
+                ax2.plot([inv_params[2] - dx, inv_params[2] + dx], 
+                        [inv_params[3] - dy, inv_params[3] + dy], 
+                        color='purple', linewidth=6, alpha=0.7)
+            
+            ax2.scatter(inv_params[2], inv_params[3], marker='+', s=200, color='black', zorder=10)
+            ax2.text(inv_params[2], inv_params[3] - 20, 
+                    f"Z={inv_params[3]:.1f}m\nα={inv_params[4]:.1f}°", 
+                    ha='center', fontsize=TICK_FONT, fontweight='bold')
+            
+            # Mark true position
+            ax2.scatter(true_params[2], true_params[3], 
+                       marker='x', s=200, color='green', label='True Position', zorder=5)
+            ax2.legend(fontsize=LEGEND_FONT, loc='lower right')
+            ax2.grid(alpha=0.3)
+            ax2.tick_params(labelsize=TICK_FONT)
+            ax2.set_xlim([200, 800])
+            ax2.set_ylim([100, 0])
         
         plt.tight_layout()
-
-        # --- SAVE THE IMAGE ---
+        
+        # Save the combined synthetic figure
         if not os.path.exists(OUTPUT_DIR):
             os.makedirs(OUTPUT_DIR)
-        
-        save_path = os.path.join(OUTPUT_DIR, "Synthetic_Cylinder_Sphere_Tests.png")
+        save_path = os.path.join(OUTPUT_DIR, "Synthetic_Cylinder_Sphere_Sheet_Tests.png")
         fig.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"\n  [INFO] Synthetic test plot saved to: {save_path}")
-        # ----------------------
-        
         plt.show()
-        plt.close(fig)  # Close the figure to free memory
+        plt.close(fig)
 
 # -----------------------------
 # HELPERS
@@ -702,10 +1040,13 @@ def analyze_profile(df, profile_name):
     print(f"   > Selected Model: {best_num_bodies} Source(s)")
     
     # MCMC Run
-    samples = inversion.run_mcmc(best_model_params, best_num_bodies)
+    samples, sampler = inversion.run_mcmc(best_model_params, best_num_bodies)
     
     # Run depth overestimation diagnosis
     inversion.diagnose_depth_overestimation(samples)
+    
+    # ---------- NEW: Plot convergence diagnostics ----------
+    inversion.plot_convergence(profile_name, OUTPUT_DIR)
     
     # -----------------------------
     # PLOTTING
@@ -840,7 +1181,7 @@ def process_file(file_path):
         print(f"Created output directory: {OUTPUT_DIR}")
     
     # --- SYNTHETIC TEST TRIGGER ---
-    run_test = input("Do you want to run Synthetic Fidelity Tests (Cylinder & Sphere) with Corner Plots? (y/n): ").strip().lower()
+    run_test = input("Do you want to run Synthetic Fidelity Tests (Cylinder, Sphere & Sheet) with Corner Plots? (y/n): ").strip().lower()
     if run_test == 'y':
         tester = SyntheticTest()
         tester.run_fidelity_check()
