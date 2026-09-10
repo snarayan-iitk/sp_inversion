@@ -49,8 +49,7 @@ def model_general_body(x, params):
     """
     Generalized SP anomaly model for a polarized body.
 
-    Standard formula (Yungul 1950; Meiser 1962; Abdelrahman et al. 2006;
-    Essa et al. 2019).  Convention: z measured positive downwards,
+    Standard formula.  Convention: z measured positive downwards,
     alpha = polarization angle measured from the horizontal.
 
         V(x) = K * [ (x - x0) cos(alpha) + z sin(alpha) ]
